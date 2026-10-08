@@ -12,7 +12,9 @@
  * Usage:
  *   compare check                       correctness test on tests/solutions.txt
  *   compare stats                       max h, mean h and gate H1 for A-D
+ *   compare gates                       gate H2: every table complete and sane
  *   compare search CAND [--prune] all11 every distance-11 state
+ *   compare search CAND [--prune] all   every state (gate H3)
  *   compare search CAND [--prune] STATE ...
  *
  * --prune skips a turn of the face turned on the previous move.
@@ -257,9 +259,160 @@ static int cmd_stats(void)
     return 0;
 }
 
+/* Gate H2 for one transition table: each face maps the n ranks one-to-one
+ * onto themselves, and four quarter turns of a face restore every rank.
+ */
+static int transitions_ok(const uint16_t *tab, uint16_t n)
+{
+    static uint8_t seen[PERMUTATIONS];
+    for (uint8_t face = 0; face < 3; ++face) {
+        memset(seen, 0, n);
+        for (uint16_t x = 0; x < n; ++x) {
+            uint16_t y = tab[face * n + x];
+            if (y >= n || seen[y]++)
+                return 0;
+            for (int turn = 1; turn < 4; ++turn)
+                y = tab[face * n + y];
+            if (y != x)
+                return 0;
+        }
+    }
+    return 1;
+}
+
+/* Gate H2 for one distance table: every entry filled, the solved entry 0 and
+ * the only 0. Prints a histogram; returns the maximum, or -1 on failure.
+ */
+static int report_distances(const char *name, const uint8_t *table, uint32_t n)
+{
+    uint32_t hist[16] = {0};
+    int max = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (table[i] > 15) {
+            printf("%s: entry %lu not filled\n", name, (unsigned long) i);
+            return -1;
+        }
+        ++hist[table[i]];
+        if (table[i] > max)
+            max = table[i];
+    }
+    printf("%-22s %8lu entries, max %2d, solved entry %u, zeros %lu\n", name,
+           (unsigned long) n, max, table[0], (unsigned long) hist[0]);
+    printf("  by distance:");
+    for (int d = 0; d <= max; ++d)
+        printf(" %lu", (unsigned long) hist[d]);
+    putchar('\n');
+    return table[0] == 0 && hist[0] == 1 ? max : -1;
+}
+
+static int cmd_gates(void)
+{
+    /* Distance distribution from report.md, section 4. */
+    static const uint32_t expected[12] = {1,      9,      54,      321,
+                                          1847,   9992,   50136,   227536,
+                                          870072, 1887748, 623800, 2644};
+    uint32_t hist[12] = {0};
+    int ok = 1;
+    int pt = transitions_ok(&ptab[0][0], PERMUTATIONS);
+    int ot = transitions_ok(&otab[0][0], ORIENTATIONS);
+    printf("permutation transitions 3 x %d, each face a bijection of order 4: "
+           "%s\n",
+           PERMUTATIONS, pt ? "pass" : "FAIL");
+    printf("orientation transitions 3 x %d, each face a bijection of order 4: "
+           "%s\n",
+           ORIENTATIONS, ot ? "pass" : "FAIL");
+    ok = pt && ot;
+    int dmax = report_distances("exact distances (BFS)", dist, STATES);
+    int bmax = report_distances("B: orientation PDB", pdb_o, ORIENTATIONS);
+    int cmax = report_distances("C: permutation PDB", pdb_p, PERMUTATIONS);
+    ok = ok && dmax == 11 && bmax >= 0 && cmax >= 0;
+    for (uint32_t rank = 0; rank < STATES; ++rank)
+        if (dist[rank] < 12)
+            ++hist[dist[rank]];
+    int match = !memcmp(hist, expected, sizeof hist);
+    printf("exact distances match report.md section 4: %s\n",
+           match ? "pass" : "FAIL");
+    ok = ok && match;
+    puts("packed tables: none, every table uses one byte per entry "
+         "(gate H4 not applicable)");
+    puts(ok ? "gate H2 passed" : "gate H2 FAILED");
+    return !ok;
+}
+
+/* Search every state (range 1) or every distance-11 state (range 11). */
+static int search_range(int range)
+{
+    uint64_t total[12] = {0}, worst[12] = {0};
+    uint32_t count[12] = {0}, worst_rank[12] = {0}, done = 0;
+    clock_t start = clock();
+    for (uint32_t rank = 0; rank < STATES; ++rank) {
+        uint8_t d = dist[rank];
+        if (range == 11 && d != 11)
+            continue;
+        if (!ida(rank) || !solution_ok(rank)) {
+            char s[15];
+            format_state(rank, s);
+            printf("FAIL: wrong or suboptimal solution for %s\n", s);
+            return 1;
+        }
+        ++count[d];
+        total[d] += expanded;
+        if (expanded > worst[d]) {
+            worst[d] = expanded;
+            worst_rank[d] = rank;
+        }
+        if (range == 1 && ++done % (STATES / 10) == 0)
+            fprintf(stderr, "  %lu%% done, %.0f s\n",
+                    (unsigned long) ((uint64_t) done * 100 / STATES),
+                    seconds_since(start));
+    }
+    double elapsed = seconds_since(start);
+    const char *pruning = prune_same_face ? " (same-face pruning)" : "";
+    char s[15];
+    if (range == 11) {
+        format_state(worst_rank[11], s);
+        printf("candidate %c%s, %lu distance-11 states, all optimal\n", cand,
+               pruning, (unsigned long) count[11]);
+        printf("  mean expansions  %.1f\n", (double) total[11] / count[11]);
+        printf("  worst expansions %llu  (state %s)\n",
+               (unsigned long long) worst[11], s);
+        printf("  est. instructions, worst state  %llu  (x%d per expansion)\n",
+               (unsigned long long) (worst[11] * NODE_COST), NODE_COST);
+        printf("  wall-clock  %.2f s\n", elapsed);
+        return 0;
+    }
+    uint64_t sum = 0, max = 0;
+    uint32_t states = 0, max_rank = 0;
+    printf("candidate %c%s, every state\n", cand, pruning);
+    printf("   d    states  mean expansions  worst expansions  worst state\n");
+    for (int d = 0; d < 12; ++d) {
+        format_state(worst_rank[d], s);
+        printf("  %2d %9lu %16.1f %17llu  %s\n", d, (unsigned long) count[d],
+               count[d] ? (double) total[d] / count[d] : 0.0,
+               (unsigned long long) worst[d], s);
+        states += count[d];
+        sum += total[d];
+        if (worst[d] > max) {
+            max = worst[d];
+            max_rank = worst_rank[d];
+        }
+    }
+    format_state(max_rank, s);
+    printf("  all %8lu %16.1f %17llu  %s\n", (unsigned long) states,
+           (double) sum / states, (unsigned long long) max, s);
+    printf("  est. instructions, worst state  %llu  (x%d per expansion)\n",
+           (unsigned long long) (max * NODE_COST), NODE_COST);
+    printf("  wall-clock  %.2f s\n", elapsed);
+    printf("gate H3 %s: %lu of %d states solved in exactly their BFS "
+           "distance\n",
+           states == STATES ? "passed" : "FAILED", (unsigned long) states,
+           STATES);
+    return states != STATES;
+}
+
 static int cmd_search(int argc, char **argv)
 {
-    int i = 0, all11 = 0;
+    int i = 0, range = 0;
     if (argc < 1 || !strchr("ABCD", argv[0][0]) || argv[0][1]) {
         fputs("search: candidate must be one of A B C D\n", stderr);
         return 2;
@@ -270,49 +423,21 @@ static int cmd_search(int argc, char **argv)
         ++i;
     }
     if (i < argc && !strcmp(argv[i], "all11"))
-        all11 = 1;
+        range = 11;
+    else if (i < argc && !strcmp(argv[i], "all"))
+        range = 1;
     if (i >= argc) {
-        fputs("search: give all11 or one or more 14-digit states\n", stderr);
-        return 2;
-    }
-    if (all11 && cand == 'A') {
-        fputs("search: candidate A over all distance-11 states would take "
-              "days; pass a few states instead\n",
+        fputs("search: give all, all11 or one or more 14-digit states\n",
               stderr);
         return 2;
     }
-    if (all11) {
-        uint64_t total = 0, worst = 0;
-        uint32_t count = 0, worst_rank = 0;
-        clock_t start = clock();
-        for (uint32_t rank = 0; rank < STATES; ++rank) {
-            if (dist[rank] != 11)
-                continue;
-            if (!ida(rank) || !solution_ok(rank)) {
-                char s[15];
-                format_state(rank, s);
-                printf("FAIL: wrong or suboptimal solution for %s\n", s);
-                return 1;
-            }
-            ++count;
-            total += expanded;
-            if (expanded > worst) {
-                worst = expanded;
-                worst_rank = rank;
-            }
-        }
-        char s[15];
-        format_state(worst_rank, s);
-        printf("candidate %c%s, %u distance-11 states, all optimal\n", cand,
-               prune_same_face ? " (same-face pruning)" : "", count);
-        printf("  mean expansions  %.1f\n", (double) total / count);
-        printf("  worst expansions %llu  (state %s)\n",
-               (unsigned long long) worst, s);
-        printf("  est. instructions, worst state  %llu  (x%d per expansion)\n",
-               (unsigned long long) (worst * NODE_COST), NODE_COST);
-        printf("  wall-clock  %.2f s\n", seconds_since(start));
-        return 0;
+    if (range && (cand == 'A' || (cand == 'B' && range == 1))) {
+        fputs("search: that run would take days; pass a few states instead\n",
+              stderr);
+        return 2;
     }
+    if (range)
+        return search_range(range);
     for (; i < argc; ++i) {
         state_t state;
         if (!parse_state(argv[i], &state)) {
@@ -341,8 +466,8 @@ static int cmd_search(int argc, char **argv)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fputs("usage: compare check | stats | search CAND [--prune] "
-              "all11|STATE...\n",
+        fputs("usage: compare check | stats | gates | search CAND [--prune] "
+              "all|all11|STATE...\n",
               stderr);
         return 2;
     }
@@ -356,6 +481,8 @@ int main(int argc, char **argv)
         return cmd_check();
     if (!strcmp(argv[1], "stats"))
         return cmd_stats();
+    if (!strcmp(argv[1], "gates"))
+        return cmd_gates();
     if (!strcmp(argv[1], "search"))
         return cmd_search(argc - 2, argv + 2);
     fprintf(stderr, "unknown command '%s'\n", argv[1]);
