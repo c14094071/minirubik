@@ -1,0 +1,3 @@
+# Test states for asm/build.sh test, one 14-digit state per line, in
+# addition to tests/solutions.txt: a solved cube, a short scramble and a
+# distance-11 state.
